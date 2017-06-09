@@ -126,7 +126,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
      * dynamic.
      */
     private def canBuildLocalHashMap(plan: LogicalPlan): Boolean = {
-      plan.stats(conf).sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+      val a = plan.stats(conf).sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+      a
     }
 
     /**
@@ -137,7 +138,8 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
      * use the size of bytes here as estimation.
      */
     private def muchSmaller(a: LogicalPlan, b: LogicalPlan): Boolean = {
-      a.stats(conf).sizeInBytes * 3 <= b.stats(conf).sizeInBytes
+      val c = (a.stats(conf).sizeInBytes * 3 <= b.stats(conf).sizeInBytes)
+      c
     }
 
     private def canBuildRight(joinType: JoinType): Boolean = joinType match {
@@ -168,15 +170,12 @@ abstract class SparkStrategies extends QueryPlanner[SparkPlan] {
       // --- ShuffledHashJoin ---------------------------------------------------------------------
 
       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
-         if !conf.preferSortMergeJoin && canBuildRight(joinType) && canBuildLocalHashMap(right)
-           && muchSmaller(right, left) ||
+         if !conf.preferSortMergeJoin && canBuildLocalHashMap(right) && muchSmaller(right, left) ||
            !RowOrdering.isOrderable(leftKeys) =>
         Seq(joins.ShuffledHashJoinExec(
           leftKeys, rightKeys, joinType, BuildRight, condition, planLater(left), planLater(right)))
-
       case ExtractEquiJoinKeys(joinType, leftKeys, rightKeys, condition, left, right)
-         if !conf.preferSortMergeJoin && canBuildLeft(joinType) && canBuildLocalHashMap(left)
-           && muchSmaller(left, right) ||
+         if !conf.preferSortMergeJoin && canBuildLocalHashMap(left) && muchSmaller(left, right) ||
            !RowOrdering.isOrderable(leftKeys) =>
         Seq(joins.ShuffledHashJoinExec(
           leftKeys, rightKeys, joinType, BuildLeft, condition, planLater(left), planLater(right)))

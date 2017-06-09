@@ -23,14 +23,19 @@ import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
 import com.esotericsoftware.kryo.io.{Input, Output}
 
 import org.apache.spark.{SparkConf, SparkEnv, SparkException}
-import org.apache.spark.memory.{MemoryConsumer, MemoryMode, StaticMemoryManager, TaskMemoryManager}
+import org.apache.spark.memory.{MemoryConsumer, StaticMemoryManager, TaskMemoryManager}
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.physical.BroadcastMode
 import org.apache.spark.sql.types.LongType
-import org.apache.spark.unsafe.Platform
+import org.apache.spark.unsafe.{Platform, UnsafeAlignedOffset}
 import org.apache.spark.unsafe.map.BytesToBytesMap
 import org.apache.spark.util.{KnownSizeEstimation, Utils}
+
+/**
+ * Convenient class for returned values from map iterator
+ */
+private[execution] case class Item(page: Object, offset: Long, row: InternalRow)
 
 /**
  * Interface for a hashed relation by some key. Use [[HashedRelation.apply]] to create a concrete
@@ -42,14 +47,14 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
    *
    * Returns null if there is no matched rows.
    */
-  def get(key: InternalRow): Iterator[InternalRow]
+  def get(key: InternalRow): Iterator[Item]
 
   /**
    * Returns matched rows for a key that has only one column with LongType.
    *
    * Returns null if there is no matched rows.
    */
-  def get(key: Long): Iterator[InternalRow] = {
+  def get(key: Long): Iterator[Item] = {
     throw new UnsupportedOperationException
   }
 
@@ -64,6 +69,26 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
   def getValue(key: Long): InternalRow = {
     throw new UnsupportedOperationException
   }
+
+  /**
+   * Returns whether the hash relation is built on the outer join side
+   */
+  def isOuterJoinHashSameSide() : Boolean
+
+  /**
+   * Return those rows that do not have matches in the other table
+   */
+  def getUnMatched() : Iterator[InternalRow]
+
+  /**
+   * Mark a row as matched with some rows in the other table
+   */
+  def markMatched(item: Item) : Unit
+
+  /**
+    * Return those rows with null keys.
+    */
+  def getNullRows(): Iterator[InternalRow]
 
   /**
    * Returns true iff all the keys are unique.
@@ -89,6 +114,7 @@ private[execution] object HashedRelation {
   def apply(
       input: Iterator[InternalRow],
       key: Seq[Expression],
+      outerJoinHashSameSide: Boolean = false,
       sizeEstimate: Int = 64,
       taskMemoryManager: TaskMemoryManager = null): HashedRelation = {
     val mm = Option(taskMemoryManager).getOrElse {
@@ -102,9 +128,137 @@ private[execution] object HashedRelation {
     }
 
     if (key.length == 1 && key.head.dataType == LongType) {
-      LongHashedRelation(input, key, sizeEstimate, mm)
+      LongHashedRelation(input, key, outerJoinHashSameSide, sizeEstimate, mm)
     } else {
-      UnsafeHashedRelation(input, key, sizeEstimate, mm)
+      UnsafeHashedRelation(input, key, outerJoinHashSameSide, sizeEstimate, mm)
+    }
+  }
+}
+
+private[joins] class BytesToUnsafeRowMap(taskMemoryManager: TaskMemoryManager,
+                                        initialCapacity: Int,
+                                        pageSizeBytes: Long)
+  extends BytesToBytesMap(taskMemoryManager, initialCapacity, pageSizeBytes) {
+
+  private val PAGE_NUMBER_BITS = TaskMemoryManager.PAGE_NUMBER_BITS
+  private val MATCHED_BITS = 1
+  private val OFFSET_BITS = TaskMemoryManager.OFFSET_BITS - MATCHED_BITS
+
+  private val PAGE_NUMBER_MASK = 0x1FFFFL
+  private val MATCHED_MASK = 0x1L
+  private val OFFSET_MASK = 0x3FFFFFFFFFFFFL
+
+  private[joins] def toAddress(page: Int, matched: Int, offset: Long): Long = {
+    page.toLong << (OFFSET_BITS + MATCHED_BITS) | matched.toLong << OFFSET_BITS | offset
+  }
+
+  private[joins] def toPage(address: Long): Int = {
+    ((address >>> (OFFSET_BITS + MATCHED_BITS)) & PAGE_NUMBER_MASK).toInt
+  }
+
+  private[joins] def toOffset(address: Long): Long = {
+    taskMemoryManager.getOffsetInPage(toAddress(toPage(address), 0, address & OFFSET_MASK))
+  }
+
+  private[joins] def toMatched(address: Long): Int = {
+    ((address >>> OFFSET_BITS) & MATCHED_MASK).toInt
+  }
+
+  override def unMaskMatchedBits(fullKeyAddress: Long): Long = {
+    fullKeyAddress & 0xFFFBFFFFFFFFFFFFL
+  }
+
+  def markMatched(item: Item): Unit = {
+    if (item.page == Nil) {
+      val pos = item.offset.toInt
+      val address = longArray.get(pos)
+      longArray.set(pos, toAddress(toPage(address), 1, address & OFFSET_MASK))
+    } else {
+      val address = Platform.getLong(item.page, item.offset)
+      val a = toAddress(toPage(address), 1, address & OFFSET_MASK)
+      Platform.putLong(item.page, item.offset, a)
+    }
+  }
+
+  /**
+    * Returns an iterator of UnsafeRow for multiple linked values.
+    */
+  def valueIter(pos: Int, resultRow: UnsafeRow): Iterator[Item] = {
+    new Iterator[Item] {
+      val uaoSize = UnsafeAlignedOffset.getUaoSize
+      var page: Object = Nil
+      var offset: Long = pos
+      var addr = longArray.get(pos)
+      override def hasNext: Boolean = addr != 0
+      override def next(): Item = {
+        var recordPage = taskMemoryManager.getPage(addr)
+        var recordMatched = toMatched(addr)
+        var recordOffset = toOffset(addr)
+
+        val recordLength = UnsafeAlignedOffset.getSize(recordPage, recordOffset)
+        recordOffset += uaoSize
+        val keyLength = UnsafeAlignedOffset.getSize(recordPage, recordOffset)
+        recordOffset += uaoSize + keyLength
+        val valueLength = recordLength - keyLength - uaoSize
+        resultRow.pointTo(recordPage, recordOffset, valueLength)
+        val result = Item(page, offset, resultRow)
+
+        recordOffset += valueLength
+        addr = Platform.getLong(recordPage, recordOffset)
+        page = recordPage
+        offset = recordOffset
+
+        result
+      }
+    }
+  }
+
+  def getUnMatched(resultRow: UnsafeRow) : Iterator[InternalRow] = {
+    new Iterator[UnsafeRow] {
+      var i = -2
+      var iter : Iterator[Item] = Iterator.empty
+
+      override def hasNext: Boolean = {
+        if (!iter.isEmpty) {
+          while (iter.hasNext) {
+            val item = iter.next()
+            val address =
+              if (item.page == Nil) {
+                longArray.get(item.offset.toInt)
+              } else {
+                Platform.getLong(item.page, item.offset)
+              }
+            if (toMatched(address) == 0) {
+              return true
+            }
+          }
+        }
+
+        i += 2
+        while (i < longArray.size - 1) {
+          if (longArray.get(i) != 0) {
+            iter = valueIter(i, resultRow)
+            while (iter.hasNext) {
+              val item = iter.next()
+              val address =
+                if (item.page == Nil) {
+                  longArray.get(item.offset.toInt)
+                } else {
+                  Platform.getLong(item.page, item.offset)
+                }
+              if (toMatched(address) == 0) {
+                return true;
+              }
+            }
+          }
+          i += 2
+        }
+        false
+      }
+
+      override def next(): UnsafeRow = {
+        resultRow
+      }
     }
   }
 }
@@ -118,7 +272,9 @@ private[execution] object HashedRelation {
  */
 private[joins] class UnsafeHashedRelation(
     private var numFields: Int,
-    private var binaryMap: BytesToBytesMap)
+    private var binaryMap: BytesToUnsafeRowMap,
+    private var nullRows: Seq[UnsafeRow] = Nil,
+    private var outerJoinHashSameSide: Boolean = false)
   extends HashedRelation with Externalizable with KryoSerializable {
 
   private[joins] def this() = this(0, null)  // Needed for serialization
@@ -126,7 +282,7 @@ private[joins] class UnsafeHashedRelation(
   override def keyIsUnique: Boolean = binaryMap.numKeys() == binaryMap.numValues()
 
   override def asReadOnlyCopy(): UnsafeHashedRelation = {
-    new UnsafeHashedRelation(numFields, binaryMap)
+    new UnsafeHashedRelation(numFields, binaryMap, nullRows, outerJoinHashSameSide)
   }
 
   override def estimatedSize: Long = binaryMap.getTotalMemoryConsumption
@@ -134,20 +290,25 @@ private[joins] class UnsafeHashedRelation(
   // re-used in get()/getValue()
   var resultRow = new UnsafeRow(numFields)
 
-  override def get(key: InternalRow): Iterator[InternalRow] = {
+  override def get(key: InternalRow): Iterator[Item] = {
     val unsafeKey = key.asInstanceOf[UnsafeRow]
     val map = binaryMap  // avoid the compiler error
     val loc = new map.Location  // this could be allocated in stack
     binaryMap.safeLookup(unsafeKey.getBaseObject, unsafeKey.getBaseOffset,
       unsafeKey.getSizeInBytes, loc, unsafeKey.hashCode())
     if (loc.isDefined) {
-      new Iterator[UnsafeRow] {
+      new Iterator[Item] {
         private var _hasNext = true
+        private var offset: Long = loc.getPos * 2
+        private var page: Object = Nil
         override def hasNext: Boolean = _hasNext
-        override def next(): UnsafeRow = {
+        override def next(): Item = {
           resultRow.pointTo(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
+          val result = Item(page, offset, resultRow)
+          page = loc.getKeyBase
+          offset = loc.getValueOffset + loc.getValueLength
           _hasNext = loc.nextValue()
-          resultRow
+          result
         }
       }
     } else {
@@ -169,23 +330,49 @@ private[joins] class UnsafeHashedRelation(
     }
   }
 
+  override def isOuterJoinHashSameSide() : Boolean = outerJoinHashSameSide
+
+  def getUnMatched() : Iterator[InternalRow] = {
+    if (outerJoinHashSameSide) {
+      binaryMap.asInstanceOf[BytesToUnsafeRowMap].getUnMatched(resultRow)
+    } else {
+      Iterator.empty
+    }
+  }
+
+  override def markMatched(item: Item): Unit = {
+    if (outerJoinHashSameSide) {
+      binaryMap.asInstanceOf[BytesToUnsafeRowMap].markMatched(item)
+    }
+  }
+
+  override def getNullRows(): Iterator[InternalRow] = {
+    if (outerJoinHashSameSide) {
+      nullRows.iterator
+    } else {
+      Iterator.empty
+    }
+  }
+
   override def close(): Unit = {
     binaryMap.free()
   }
 
   override def writeExternal(out: ObjectOutput): Unit = Utils.tryOrIOException {
-    write(out.writeInt, out.writeLong, out.write)
+    write(out.writeInt, out.writeBoolean, out.writeLong, out.write)
   }
 
   override def write(kryo: Kryo, out: Output): Unit = Utils.tryOrIOException {
-    write(out.writeInt, out.writeLong, out.write)
+    write(out.writeInt, out.writeBoolean, out.writeLong, out.write)
   }
 
   private def write(
       writeInt: (Int) => Unit,
+      writeBoolean: (Boolean) => Unit,
       writeLong: (Long) => Unit,
       writeBuffer: (Array[Byte], Int, Int) => Unit) : Unit = {
     writeInt(numFields)
+    writeBoolean(outerJoinHashSameSide)
     // TODO: move these into BytesToBytesMap
     writeLong(binaryMap.numKeys())
     writeLong(binaryMap.numValues())
@@ -205,20 +392,57 @@ private[joins] class UnsafeHashedRelation(
       // [key size] [values size] [key bytes] [value bytes]
       writeInt(loc.getKeyLength)
       writeInt(loc.getValueLength)
+
       write(loc.getKeyBase, loc.getKeyOffset, loc.getKeyLength)
       write(loc.getValueBase, loc.getValueOffset, loc.getValueLength)
+    }
+
+    if (outerJoinHashSameSide) {
+      // write out null rows
+      writeInt(nullRows.size)
+      val nullIter = nullRows.iterator
+      while (nullIter.hasNext) {
+        val row = nullIter.next()
+        writeInt(row.getSizeInBytes)
+        write(row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
+      }
+
+      // write out the matched info
+      var i = 0
+      var array = binaryMap.getArray
+      var map = binaryMap.asInstanceOf[BytesToUnsafeRowMap]
+      while (i < array.size - 1) {
+        val iter = map.valueIter(i, resultRow)
+        while (iter.hasNext) {
+          val item = iter.next()
+          val address =
+            if (item.page == Nil) {
+              array.get(item.offset.toInt)
+            } else {
+              Platform.getLong(item.page, item.offset)
+            }
+          writeInt(map.toMatched(address))
+        }
+        i += 2
+      }
     }
   }
 
   override def readExternal(in: ObjectInput): Unit = Utils.tryOrIOException {
-    read(in.readInt, in.readLong, in.readFully)
+    read(in.readInt, in.readBoolean, in.readLong, in.readFully)
+  }
+
+  override def read(kryo: Kryo, in: Input): Unit = Utils.tryOrIOException {
+    read(in.readInt, in.readBoolean, in.readLong, in.readBytes)
   }
 
   private def read(
       readInt: () => Int,
+      readBoolean: () => Boolean,
       readLong: () => Long,
       readBuffer: (Array[Byte], Int, Int) => Unit): Unit = {
     numFields = readInt()
+    outerJoinHashSameSide = readBoolean()
     resultRow = new UnsafeRow(numFields)
     val nKeys = readLong()
     val nValues = readLong()
@@ -239,10 +463,11 @@ private[joins] class UnsafeHashedRelation(
     // TODO(josh): We won't need this dummy memory manager after future refactorings; revisit
     // during code review
 
-    binaryMap = new BytesToBytesMap(
-      taskMemoryManager,
-      (nKeys * 1.5 + 1).toInt, // reduce hash collision
-      pageSizeBytes)
+    binaryMap =
+      new BytesToUnsafeRowMap(taskMemoryManager,
+        (nKeys * 1.5 + 1).toInt, // reduce hash collision
+        pageSizeBytes)
+
 
     var i = 0
     var keyBuffer = new Array[Byte](1024)
@@ -264,14 +489,41 @@ private[joins] class UnsafeHashedRelation(
         valuesBuffer, Platform.BYTE_ARRAY_OFFSET, valuesSize)
       if (!putSuceeded) {
         binaryMap.free()
-        throw new IOException("Could not allocate memory to grow BytesToBytesMap")
+        throw new IOException("Could not allocate memory to grow BytesToUnsafeRowMap")
       }
       i += 1
     }
-  }
 
-  override def read(kryo: Kryo, in: Input): Unit = Utils.tryOrIOException {
-    read(in.readInt, in.readLong, in.readBytes)
+    if (outerJoinHashSameSide) {
+      // read null rows
+      val nNullRows = readInt()
+      nullRows = Nil
+      var i = 0;
+      while (i < nNullRows) {
+        val rowSize = readInt()
+        var rowBuffer = new Array[Byte](rowSize)
+        readBuffer(rowBuffer, 0, rowSize)
+        val nullRow = new UnsafeRow(numFields)
+        nullRow.pointTo(rowBuffer, rowSize)
+        nullRows = nullRows :+ (nullRow)
+        i += 1
+      }
+
+      // set the matched info
+      i = 0
+      var array = binaryMap.getArray
+      var map = binaryMap.asInstanceOf[BytesToUnsafeRowMap]
+      while (i < array.size - 1) {
+        val iter = map.valueIter(i, resultRow)
+        while (iter.hasNext) {
+          val item = iter.next()
+          if (readInt() != 0) {
+            map.markMatched(item)
+          }
+        }
+        i += 2
+      }
+    }
   }
 }
 
@@ -280,26 +532,35 @@ private[joins] object UnsafeHashedRelation {
   def apply(
       input: Iterator[InternalRow],
       key: Seq[Expression],
+      outerJoinHashSameSide: Boolean,
       sizeEstimate: Int,
       taskMemoryManager: TaskMemoryManager): HashedRelation = {
-
     val pageSizeBytes = Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
       .getOrElse(new SparkConf().getSizeAsBytes("spark.buffer.pageSize", "16m"))
 
-    val binaryMap = new BytesToBytesMap(
-      taskMemoryManager,
-      // Only 70% of the slots can be used before growing, more capacity help to reduce collision
-      (sizeEstimate * 1.5 + 1).toInt,
-      pageSizeBytes)
+    val binaryMap =
+      new BytesToUnsafeRowMap(
+        taskMemoryManager,
+        // Only 70% of the slots can be used before growing,
+        // more capacity help to reduce collision
+        (sizeEstimate * 1.5 + 1).toInt,
+        pageSizeBytes)
+
+    var nullRows : Seq[UnsafeRow] = Nil
 
     // Create a mapping of buildKeys -> rows
     val keyGenerator = UnsafeProjection.create(key)
     var numFields = 0
     while (input.hasNext) {
       val row = input.next().asInstanceOf[UnsafeRow]
+      val b = row.isNullAt(0)
       numFields = row.numFields()
       val key = keyGenerator(row)
-      if (!key.anyNull) {
+      if (key.anyNull) {
+        if (outerJoinHashSameSide) {
+          nullRows = nullRows :+ (row)
+        }
+      } else {
         val loc = binaryMap.lookup(key.getBaseObject, key.getBaseOffset, key.getSizeInBytes)
         val success = loc.append(
           key.getBaseObject, key.getBaseOffset, key.getSizeInBytes,
@@ -311,7 +572,7 @@ private[joins] object UnsafeHashedRelation {
       }
     }
 
-    new UnsafeHashedRelation(numFields, binaryMap)
+    new UnsafeHashedRelation(numFields, binaryMap, nullRows, outerJoinHashSameSide)
   }
 }
 
@@ -378,6 +639,10 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   // The number of bits for size in address
   private val SIZE_BITS = 28
   private val SIZE_MASK = 0xfffffff
+
+  // The number of bits for matched row indicator
+  private val MATCHED_BITS = 1
+  private val MATCHED_MASK = 0x1
 
   // The total number of values of all keys.
   private var numValues = 0L
@@ -447,16 +712,21 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
    */
   private def nextSlot(pos: Int): Int = (pos + 2) & mask
 
-  private[this] def toAddress(offset: Long, size: Int): Long = {
-    ((offset - Platform.LONG_ARRAY_OFFSET) << SIZE_BITS) | size
+  private[this] def toAddress(offset: Long, matchedBit: Int, size: Int): Long = {
+    ((offset - Platform.LONG_ARRAY_OFFSET) << (SIZE_BITS + MATCHED_BITS)) |
+      matchedBit << SIZE_BITS | size
   }
 
   private[this] def toOffset(address: Long): Long = {
-    (address >>> SIZE_BITS) + Platform.LONG_ARRAY_OFFSET
+    (address >>> (SIZE_BITS + MATCHED_BITS)) + Platform.LONG_ARRAY_OFFSET
   }
 
   private[this] def toSize(address: Long): Int = {
     (address & SIZE_MASK).toInt
+  }
+
+  private[this] def toMatched(address: Long): Int = {
+    ((address >>> SIZE_BITS) & MATCHED_MASK).toInt
   }
 
   private def getRow(address: Long, resultRow: UnsafeRow): UnsafeRow = {
@@ -490,16 +760,22 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   /**
    * Returns an iterator of UnsafeRow for multiple linked values.
    */
-  private def valueIter(address: Long, resultRow: UnsafeRow): Iterator[UnsafeRow] = {
-    new Iterator[UnsafeRow] {
-      var addr = address
+  private def valueIter(pos: Int, resultRow: UnsafeRow)
+    : Iterator[Item] = {
+    new Iterator[Item] {
+      var addr = array(pos)
+      var baseObject: Object = Nil
+      var offset: Long = pos
       override def hasNext: Boolean = addr != 0
-      override def next(): UnsafeRow = {
-        val offset = toOffset(addr)
+      override def next(): Item = {
+        val pageOffset = toOffset(addr)
         val size = toSize(addr)
-        resultRow.pointTo(page, offset, size)
-        addr = Platform.getLong(page, offset + size)
-        resultRow
+        resultRow.pointTo(page, pageOffset, size)
+        val result = Item(baseObject, offset, resultRow)
+        offset = pageOffset + size
+        baseObject = page
+        addr = Platform.getLong(page, pageOffset + size)
+        result
       }
     }
   }
@@ -507,19 +783,20 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   /**
    * Returns an iterator for all the values for the given key, or null if no value found.
    */
-  def get(key: Long, resultRow: UnsafeRow): Iterator[UnsafeRow] = {
+  def get(key: Long, resultRow: UnsafeRow): Iterator[Item] = {
     if (isDense) {
       if (key >= minKey && key <= maxKey) {
-        val value = array((key - minKey).toInt)
+        val idx = (key - minKey).toInt
+        val value = array(idx)
         if (value > 0) {
-          return valueIter(value, resultRow)
+          return valueIter(idx, resultRow)
         }
       }
     } else {
       var pos = firstSlot(key)
       while (array(pos + 1) != 0) {
         if (array(pos) == key) {
-          return valueIter(array(pos + 1), resultRow)
+          return valueIter(pos + 1, resultRow)
         }
         pos = nextSlot(pos)
       }
@@ -564,7 +841,7 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     Platform.putLong(page, cursor, 0)
     cursor += 8
     numValues += 1
-    updateIndex(key, toAddress(offset, row.getSizeInBytes))
+    updateIndex(key, toAddress(offset, 0, row.getSizeInBytes))
   }
 
   /**
@@ -615,6 +892,70 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
     }
     old_array = null  // release the reference to old array
     freeMemory(n * 8L)
+  }
+
+  def getUnMatched(resultRow: UnsafeRow) : Iterator[InternalRow] = {
+    println("!!!!!!!!! map size: " + array.length)
+    new Iterator[UnsafeRow] {
+      val idxIncr = if (isDense) 1 else 2
+      val addrAdjust = if (isDense) 0 else 1
+      var i = if (isDense) -1 else -2
+      var iter : Iterator[Item] = Iterator.empty
+
+      override def hasNext: Boolean = {
+        if (iter != null) {
+          while (iter.hasNext) {
+            val item = iter.next()
+            val address =
+              if (item.page == Nil) {
+                array(item.offset.toInt)
+              } else {
+                Platform.getLong(item.page, item.offset)
+              }
+            if (toMatched(address) == 0) {
+              return true
+            }
+          }
+        }
+
+        i += idxIncr
+        while (i < array.length) {
+          if (array(i + addrAdjust) != 0) {
+            iter = valueIter(i + addrAdjust, resultRow)
+            while (iter.hasNext) {
+              val item = iter.next()
+              val address =
+                if (item.page == Nil) {
+                  array(item.offset.toInt)
+                } else {
+                  Platform.getLong(item.page, item.offset)
+                }
+              if (toMatched(address) == 0) {
+                return true;
+              }
+            }
+          }
+          i += idxIncr
+        }
+        false
+      }
+
+      override def next(): UnsafeRow = {
+        resultRow
+      }
+    }
+  }
+
+  def markMatched(item: Item) : Unit = {
+    if (item.page == Nil) {
+      val offset2 = item.offset.toInt
+      val address = array(offset2)
+      array(offset2) = toAddress(toOffset(address), 1, toSize(address))
+    } else {
+      val address = Platform.getLong(page, item.offset)
+      val a = toAddress(toOffset(address), 1, toSize(address))
+      Platform.putLong(page, item.offset, a)
+    }
   }
 
   /**
@@ -746,18 +1087,21 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
 
 private[joins] class LongHashedRelation(
     private var nFields: Int,
-    private var map: LongToUnsafeRowMap) extends HashedRelation with Externalizable {
+    private var map: LongToUnsafeRowMap,
+    private var nullRows: Seq[UnsafeRow] = Nil,
+    private var outerJoinHashSameSide: Boolean = false) extends HashedRelation with Externalizable {
 
   private var resultRow: UnsafeRow = new UnsafeRow(nFields)
 
   // Needed for serialization (it is public to make Java serialization work)
   def this() = this(0, null)
 
-  override def asReadOnlyCopy(): LongHashedRelation = new LongHashedRelation(nFields, map)
+  override def asReadOnlyCopy(): LongHashedRelation =
+    new LongHashedRelation(nFields, map, nullRows, outerJoinHashSameSide)
 
   override def estimatedSize: Long = map.getTotalMemoryConsumption
 
-  override def get(key: InternalRow): Iterator[InternalRow] = {
+  override def get(key: InternalRow): Iterator[Item] = {
     if (key.isNullAt(0)) {
       null
     } else {
@@ -773,11 +1117,36 @@ private[joins] class LongHashedRelation(
     }
   }
 
-  override def get(key: Long): Iterator[InternalRow] = map.get(key, resultRow)
+  override def get(key: Long): Iterator[Item] = map.get(key, resultRow)
 
   override def getValue(key: Long): InternalRow = map.getValue(key, resultRow)
 
   override def keyIsUnique: Boolean = map.keyIsUnique
+
+  override def isOuterJoinHashSameSide() : Boolean = outerJoinHashSameSide
+
+  override def getUnMatched(): Iterator[InternalRow] = {
+    if (outerJoinHashSameSide) {
+      map.getUnMatched(resultRow)
+    } else {
+      Iterator.empty
+    }
+    map.getUnMatched(resultRow)
+  }
+
+  override def markMatched(item: Item): Unit = {
+    if (outerJoinHashSameSide) {
+      map.markMatched(item)
+    }
+  }
+
+  override def getNullRows(): Iterator[InternalRow] = {
+    if (outerJoinHashSameSide) {
+      nullRows.iterator
+    } else {
+      Iterator.empty
+    }
+  }
 
   override def close(): Unit = {
     map.free()
@@ -785,13 +1154,52 @@ private[joins] class LongHashedRelation(
 
   override def writeExternal(out: ObjectOutput): Unit = {
     out.writeInt(nFields)
+    out.writeBoolean(outerJoinHashSameSide)
     out.writeObject(map)
+
+    if (outerJoinHashSameSide) {
+      var buffer = new Array[Byte](64)
+      def write(base: Object, offset: Long, length: Int): Unit = {
+        if (buffer.length < length) {
+          buffer = new Array[Byte](length)
+        }
+        Platform.copyMemory(base, offset, buffer, Platform.BYTE_ARRAY_OFFSET, length)
+        out.write(buffer, 0, length)
+      }
+
+      // write out null rows
+      out.writeInt(nullRows.size)
+      val nullIter = nullRows.iterator
+      while (nullIter.hasNext) {
+        val row = nullIter.next()
+        out.writeInt(row.getSizeInBytes)
+        write(row.getBaseObject, row.getBaseOffset, row.getSizeInBytes)
+      }
+    }
   }
 
   override def readExternal(in: ObjectInput): Unit = {
     nFields = in.readInt()
+    outerJoinHashSameSide = in.readBoolean()
     resultRow = new UnsafeRow(nFields)
     map = in.readObject().asInstanceOf[LongToUnsafeRowMap]
+
+    if (outerJoinHashSameSide) {
+      // read null rows
+      val nNullRows = in.readInt()
+      nullRows = Nil
+      var i = 0;
+      while (i < nNullRows) {
+        val rowSize = in.readInt()
+
+        var rowBuffer = new Array[Byte](rowSize)
+        in.read(rowBuffer, 0, rowSize)
+        val nullRow = new UnsafeRow(nFields)
+        nullRow.pointTo(rowBuffer, rowSize)
+        nullRows = nullRows :+ (nullRow)
+        i += 1
+      }
+    }
   }
 }
 
@@ -802,11 +1210,14 @@ private[joins] object LongHashedRelation {
   def apply(
       input: Iterator[InternalRow],
       key: Seq[Expression],
+      outerJoinHashSameSide: Boolean,
       sizeEstimate: Int,
       taskMemoryManager: TaskMemoryManager): LongHashedRelation = {
 
     val map = new LongToUnsafeRowMap(taskMemoryManager, sizeEstimate)
     val keyGenerator = UnsafeProjection.create(key)
+
+    var nullRows : Seq[UnsafeRow] = Nil
 
     // Create a mapping of key -> rows
     var numFields = 0
@@ -814,13 +1225,15 @@ private[joins] object LongHashedRelation {
       val unsafeRow = input.next().asInstanceOf[UnsafeRow]
       numFields = unsafeRow.numFields()
       val rowKey = keyGenerator(unsafeRow)
-      if (!rowKey.isNullAt(0)) {
+      if (rowKey.isNullAt(0)) {
+        if (outerJoinHashSameSide) nullRows = nullRows :+ (unsafeRow)
+      } else {
         val key = rowKey.getLong(0)
         map.append(key, unsafeRow)
       }
     }
     map.optimize()
-    new LongHashedRelation(numFields, map)
+    new LongHashedRelation(numFields, map, nullRows, outerJoinHashSameSide)
   }
 }
 
@@ -829,7 +1242,7 @@ private[execution] case class HashedRelationBroadcastMode(key: Seq[Expression])
   extends BroadcastMode {
 
   override def transform(rows: Array[InternalRow]): HashedRelation = {
-    HashedRelation(rows.iterator, canonicalized.key, rows.length)
+    HashedRelation(rows.iterator, canonicalized.key, false, rows.length)
   }
 
   override lazy val canonicalized: HashedRelationBroadcastMode = {

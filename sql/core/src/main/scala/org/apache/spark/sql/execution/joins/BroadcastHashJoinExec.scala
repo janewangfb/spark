@@ -226,7 +226,7 @@ case class BroadcastHashJoinExec(
          |$iteratorCls $matches = $anyNull ? null : ($iteratorCls)$relationTerm.get(${keyEv.value});
          |if ($matches == null) continue;
          |while ($matches.hasNext()) {
-         |  UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |  UnsafeRow $matched = (UnsafeRow) $matches.next().row;
          |  $checkCondition
          |  $numOutput.add(1);
          |  ${consume(ctx, resultVars)}
@@ -300,7 +300,7 @@ case class BroadcastHashJoinExec(
          |// the last iteration of this loop is to emit an empty row if there is no matched rows.
          |while ($matches != null && $matches.hasNext() || !$found) {
          |  UnsafeRow $matched = $matches != null && $matches.hasNext() ?
-         |    (UnsafeRow) $matches.next() : null;
+         |    (UnsafeRow) $matches.next().row : null;
          |  ${checkCondition.trim}
          |  if (!$conditionPassed) continue;
          |  $found = true;
@@ -342,7 +342,7 @@ case class BroadcastHashJoinExec(
          |if ($matches == null) continue;
          |boolean $found = false;
          |while (!$found && $matches.hasNext()) {
-         |  UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |  UnsafeRow $matched = (UnsafeRow) $matches.next().row;
          |  $checkCondition
          |  $found = true;
          |}
@@ -394,7 +394,7 @@ case class BroadcastHashJoinExec(
          |    // Evaluate the condition.
          |    boolean $found = false;
          |    while (!$found && $matches.hasNext()) {
-         |      UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |      UnsafeRow $matched = (UnsafeRow) $matches.next().row;
          |      $checkCondition
          |      $found = true;
          |    }
@@ -460,7 +460,7 @@ case class BroadcastHashJoinExec(
          |boolean $existsVar = false;
          |if ($matches != null) {
          |  while (!$existsVar && $matches.hasNext()) {
-         |    UnsafeRow $matched = (UnsafeRow) $matches.next();
+         |    UnsafeRow $matched = (UnsafeRow) $matches.next().row;
          |    $checkCondition
          |  }
          |}

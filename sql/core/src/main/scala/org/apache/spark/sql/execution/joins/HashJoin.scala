@@ -105,21 +105,21 @@ trait HashJoin {
       joinRow.withLeft(srow)
       val matches = hashedRelation.get(joinKeys(srow))
       if (matches != null) {
-        matches.map(joinRow.withRight(_)).filter(boundCondition)
+        matches.map(item => joinRow.withRight(item.row)).filter(boundCondition)
       } else {
         Seq.empty
       }
     }
   }
 
-  private def outerJoin(
-      streamedIter: Iterator[InternalRow],
-    hashedRelation: HashedRelation): Iterator[InternalRow] = {
+  private def outerJoin(streamedIter: Iterator[InternalRow],
+                        hashedRelation: HashedRelation): Iterator[InternalRow] = {
+    val outerJoinHashSameSide = hashedRelation.isOuterJoinHashSameSide()
     val joinedRow = new JoinedRow()
     val keyGenerator = streamSideKeyGenerator()
     val nullRow = new GenericInternalRow(buildPlan.output.length)
 
-    streamedIter.flatMap { currentRow =>
+    val matchedIter = streamedIter.flatMap { currentRow =>
       val rowKey = keyGenerator(currentRow)
       joinedRow.withLeft(currentRow)
       val buildIter = hashedRelation.get(rowKey)
@@ -127,13 +127,16 @@ trait HashJoin {
         private var found = false
         override def advanceNext(): Boolean = {
           while (buildIter != null && buildIter.hasNext) {
-            val nextBuildRow = buildIter.next()
-            if (boundCondition(joinedRow.withRight(nextBuildRow))) {
+            val nextItem = buildIter.next()
+            if (boundCondition(joinedRow.withRight(nextItem.row))) {
+              if (outerJoinHashSameSide) {
+                hashedRelation.markMatched(nextItem)
+              }
               found = true
               return true
             }
           }
-          if (!found) {
+          if (!found && !outerJoinHashSameSide) {
             joinedRow.withRight(nullRow)
             found = true
             return true
@@ -142,6 +145,42 @@ trait HashJoin {
         }
         override def getRow: InternalRow = joinedRow
       }.toScala
+    }
+
+    if (outerJoinHashSameSide) {
+      val unmatchedIter = new RowIterator {
+        val a = hashedRelation.getUnMatched()
+
+        override def advanceNext(): Boolean = {
+          while (a.hasNext) {
+            joinedRow.withRight(a.next)
+            joinedRow.withLeft(nullRow)
+            return true
+          }
+          false
+        }
+
+        override def getRow: InternalRow = joinedRow
+      }.toScala
+
+      val nullIter = new RowIterator {
+        val a = hashedRelation.getNullRows()
+
+        override def advanceNext(): Boolean = {
+          while (a.hasNext) {
+            joinedRow.withRight(a.next)
+            joinedRow.withLeft(nullRow)
+            return true
+          }
+          false
+        }
+
+        override def getRow: InternalRow = joinedRow
+      }.toScala
+
+      matchedIter ++ unmatchedIter ++ nullIter
+    } else {
+      matchedIter
     }
   }
 
@@ -154,7 +193,7 @@ trait HashJoin {
       val key = joinKeys(current)
       lazy val buildIter = hashedRelation.get(key)
       !key.anyNull && buildIter != null && (condition.isEmpty || buildIter.exists {
-        (row: InternalRow) => boundCondition(joinedRow(current, row))
+        (item: Item) => boundCondition(joinedRow(current, item.row))
       })
     }
   }
@@ -169,7 +208,7 @@ trait HashJoin {
       val key = joinKeys(current)
       lazy val buildIter = hashedRelation.get(key)
       val exists = !key.anyNull && buildIter != null && (condition.isEmpty || buildIter.exists {
-        (row: InternalRow) => boundCondition(joinedRow(current, row))
+        (item: Item) => boundCondition(joinedRow(current, item.row))
       })
       result.setBoolean(0, exists)
       joinedRow(current, result)
@@ -185,7 +224,7 @@ trait HashJoin {
       val key = joinKeys(current)
       lazy val buildIter = hashedRelation.get(key)
       key.anyNull || buildIter == null || (condition.isDefined && !buildIter.exists {
-        row => boundCondition(joinedRow(current, row))
+        item => boundCondition(joinedRow(current, item.row))
       })
     }
   }

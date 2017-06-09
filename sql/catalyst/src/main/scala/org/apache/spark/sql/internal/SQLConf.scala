@@ -810,6 +810,11 @@ object SQLConf {
       .intConf
       .createWithDefault(UnsafeExternalSorter.DEFAULT_NUM_ELEMENTS_FOR_SPILL_THRESHOLD.toInt)
 
+  val OUTER_JOIN_HASH_SIDE_OPT = buildConf("spark.sql.outerjoin.hashside.opt")
+    .doc("For left/right outer join, whether to automatically pick which table for hashing")
+    .booleanConf
+    .createWithDefault(true)
+
   object Deprecated {
     val MAPRED_REDUCE_TASKS = "mapred.reduce.tasks"
   }
@@ -1069,6 +1074,8 @@ class SQLConf extends Serializable with Logging {
   def starSchemaDetection: Boolean = getConf(STARSCHEMA_DETECTION)
 
   def starSchemaFTRatio: Double = getConf(STARSCHEMA_FACT_TABLE_RATIO)
+
+  def outerJoinHashSizeOpt: Boolean = getConf(OUTER_JOIN_HASH_SIDE_OPT)
 
   /** ********************** SQLConf functionality methods ************ */
 

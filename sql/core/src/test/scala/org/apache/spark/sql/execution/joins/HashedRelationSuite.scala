@@ -28,7 +28,6 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types.{IntegerType, LongType, StringType, StructField, StructType}
-import org.apache.spark.unsafe.map.BytesToBytesMap
 import org.apache.spark.unsafe.types.UTF8String
 import org.apache.spark.util.collection.CompactBuffer
 
@@ -48,18 +47,17 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     val toUnsafe = UnsafeProjection.create(schema)
     val unsafeData = data.map(toUnsafe(_).copy())
 
-
     val buildKey = Seq(BoundReference(0, IntegerType, false))
-    val hashed = UnsafeHashedRelation(unsafeData.iterator, buildKey, 1, mm)
+    val hashed = UnsafeHashedRelation(unsafeData.iterator, buildKey, false, 1, mm)
     assert(hashed.isInstanceOf[UnsafeHashedRelation])
 
-    assert(hashed.get(unsafeData(0)).toArray === Array(unsafeData(0)))
-    assert(hashed.get(unsafeData(1)).toArray === Array(unsafeData(1)))
+    assert(hashed.get(unsafeData(0)).map(t => t.row).toArray === Array(unsafeData(0)))
+    assert(hashed.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
     assert(hashed.get(toUnsafe(InternalRow(10))) === null)
 
     val data2 = CompactBuffer[InternalRow](unsafeData(2).copy())
     data2 += unsafeData(2).copy()
-    assert(hashed.get(unsafeData(2)).toArray === data2.toArray)
+    assert(hashed.get(unsafeData(2)).map(t => t.row).toArray === data2.toArray)
 
     val os = new ByteArrayOutputStream()
     val out = new ObjectOutputStream(os)
@@ -68,10 +66,10 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     val in = new ObjectInputStream(new ByteArrayInputStream(os.toByteArray))
     val hashed2 = new UnsafeHashedRelation()
     hashed2.readExternal(in)
-    assert(hashed2.get(unsafeData(0)).toArray === Array(unsafeData(0)))
-    assert(hashed2.get(unsafeData(1)).toArray === Array(unsafeData(1)))
+    assert(hashed2.get(unsafeData(0)).map(t => t.row).toArray === Array(unsafeData(0)))
+    assert(hashed2.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
     assert(hashed2.get(toUnsafe(InternalRow(10))) === null)
-    assert(hashed2.get(unsafeData(2)).toArray === data2)
+    assert(hashed2.get(unsafeData(2)).map(t => t.row).toArray === data2)
 
     val os2 = new ByteArrayOutputStream()
     val out2 = new ObjectOutputStream(os2)
@@ -82,7 +80,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     assert(java.util.Arrays.equals(os2.toByteArray, os.toByteArray))
   }
 
-  test("test serialization empty hash map") {
+  test("UnsafeHashedRelation serialization empty hash map") {
     val taskMemoryManager = new TaskMemoryManager(
       new StaticMemoryManager(
         new SparkConf().set("spark.memory.offHeap.enabled", "false"),
@@ -90,7 +88,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
         Long.MaxValue,
         1),
       0)
-    val binaryMap = new BytesToBytesMap(taskMemoryManager, 1, 1)
+    val binaryMap = new BytesToUnsafeRowMap(taskMemoryManager, 1, 1)
     val os = new ByteArrayOutputStream()
     val out = new ObjectOutputStream(os)
     val hashed = new UnsafeHashedRelation(1, binaryMap)
@@ -112,12 +110,71 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     assert(java.util.Arrays.equals(os2.toByteArray, os.toByteArray))
   }
 
+  test("UnsafeHashedRelation serialization with matched and null rows") {
+    val schema = StructType(StructField("a", IntegerType, true)::
+                            StructField("b", IntegerType, true)::Nil)
+    val data = Array(InternalRow.apply(null, null),
+                     InternalRow(0, 0),
+                     InternalRow(1, 1),
+                     InternalRow(2, 2),
+                     InternalRow.apply(null, 1),
+                     InternalRow(2, 2),
+                     InternalRow.apply(null, 2))
+    val toUnsafe = UnsafeProjection.create(schema)
+    val unsafeData = data.map(toUnsafe(_).copy())
+
+    val buildKey = Seq(BoundReference(0, IntegerType, true), BoundReference(1, IntegerType, true))
+    val hashed = UnsafeHashedRelation(unsafeData.iterator, buildKey, true, 2, mm)
+    assert(hashed.isInstanceOf[UnsafeHashedRelation])
+    assert(hashed.getNullRows().size == 3)
+
+    var iter = hashed.get(unsafeData(2))
+    while (iter.hasNext) {
+      hashed.markMatched(iter.next())
+    }
+    iter = hashed.get(unsafeData(3))
+    if (iter.hasNext) {
+      hashed.markMatched(iter.next())
+    }
+    assert(hashed.getUnMatched().map(t => t.getInt(0)).toArray === Array(0, 2))
+
+    assert(hashed.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
+    assert(hashed.get(unsafeData(2)).map(t => t.row).toArray === Array(unsafeData(2)))
+    assert(hashed.get(toUnsafe(InternalRow(10, 10))) === null)
+
+    val data2 = CompactBuffer[InternalRow](unsafeData(3).copy())
+    data2 += unsafeData(3).copy()
+    assert(hashed.get(unsafeData(3)).map(t => t.row).toArray === data2.toArray)
+
+    val os = new ByteArrayOutputStream()
+    val out = new ObjectOutputStream(os)
+    hashed.asInstanceOf[UnsafeHashedRelation].writeExternal(out)
+    out.flush()
+    val in = new ObjectInputStream(new ByteArrayInputStream(os.toByteArray))
+    val hashed2 = new UnsafeHashedRelation()
+    hashed2.readExternal(in)
+    assert(hashed2.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
+    assert(hashed2.get(unsafeData(2)).map(t => t.row).toArray === Array(unsafeData(2)))
+    assert(hashed2.get(toUnsafe(InternalRow(10, 10))) === null)
+    assert(hashed2.get(unsafeData(3)).map(t => t.row).toArray === data2)
+    assert(hashed2.getNullRows().size == 3)
+    assert(hashed2.getUnMatched().map(t => t.getInt(0)).toArray === Array(0, 2))
+
+    val os2 = new ByteArrayOutputStream()
+    val out2 = new ObjectOutputStream(os2)
+    hashed2.asInstanceOf[UnsafeHashedRelation].writeExternal(out2)
+    out2.flush()
+    // This depends on that the order of items in BytesToBytesMap.iterator() is exactly the same
+    // as they are inserted
+    assert(java.util.Arrays.equals(os2.toByteArray, os.toByteArray))
+  }
+
   test("LongToUnsafeRowMap") {
     val unsafeProj = UnsafeProjection.create(
       Seq(BoundReference(0, LongType, false), BoundReference(1, IntegerType, true)))
     val rows = (0 until 100).map(i => unsafeProj(InternalRow(Int.int2long(i), i + 1)).copy())
     val key = Seq(BoundReference(0, LongType, false))
-    val longRelation = LongHashedRelation(rows.iterator, key, 10, mm)
+    val longRelation = LongHashedRelation(rows.iterator, key, false, 10, mm)
     assert(longRelation.keyIsUnique)
     (0 until 100).foreach { i =>
       val row = longRelation.getValue(i)
@@ -125,15 +182,15 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       assert(row.getInt(1) === i + 1)
     }
 
-    val longRelation2 = LongHashedRelation(rows.iterator ++ rows.iterator, key, 100, mm)
+    val longRelation2 = LongHashedRelation(rows.iterator ++ rows.iterator, key, false, 100, mm)
     assert(!longRelation2.keyIsUnique)
     (0 until 100).foreach { i =>
-      val rows = longRelation2.get(i).toArray
-      assert(rows.length === 2)
-      assert(rows(0).getLong(0) === i)
-      assert(rows(0).getInt(1) === i + 1)
-      assert(rows(1).getLong(0) === i)
-      assert(rows(1).getInt(1) === i + 1)
+      val items = longRelation2.get(i).toArray
+      assert(items.length === 2)
+      assert(items(0).row.getLong(0) === i)
+      assert(items(0).row.getInt(1) === i + 1)
+      assert(items(1).row.getLong(0) === i)
+      assert(items(1).row.getInt(1) === i + 1)
     }
 
     val os = new ByteArrayOutputStream()
@@ -145,13 +202,62 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     relation.readExternal(in)
     assert(!relation.keyIsUnique)
     (0 until 100).foreach { i =>
-      val rows = relation.get(i).toArray
-      assert(rows.length === 2)
-      assert(rows(0).getLong(0) === i)
-      assert(rows(0).getInt(1) === i + 1)
-      assert(rows(1).getLong(0) === i)
-      assert(rows(1).getInt(1) === i + 1)
+      val items = relation.get(i).toArray
+      assert(items.length === 2)
+      assert(items(0).row.getLong(0) === i)
+      assert(items(0).row.getInt(1) === i + 1)
+      assert(items(1).row.getLong(0) === i)
+      assert(items(1).row.getInt(1) === i + 1)
     }
+  }
+
+  test("LongToUnsafeRowMap with matched and null rows") {
+    val unsafeProj = UnsafeProjection.create(
+      Seq(BoundReference(0, LongType, true), BoundReference(1, IntegerType, true)))
+    val data = Array(InternalRow.apply(null, null),
+      InternalRow(0L, 0),
+      InternalRow(1L, 1),
+      InternalRow(2L, 2),
+      InternalRow.apply(null, 1),
+      InternalRow(2L, 2),
+      InternalRow.apply(null, 2))
+    val unsafeData = data.map(unsafeProj(_).copy())
+    val key = Seq(BoundReference(0, LongType, true))
+    val hashed = LongHashedRelation(unsafeData.iterator, key, true, 10, mm)
+    assert(!hashed.keyIsUnique)
+    assert(hashed.getNullRows().size == 3)
+
+    var iter = hashed.get(unsafeData(2))
+    while (iter.hasNext) {
+      hashed.markMatched(iter.next())
+    }
+    iter = hashed.get(unsafeData(3))
+    if (iter.hasNext) {
+      hashed.markMatched(iter.next())
+    }
+    assert(hashed.getUnMatched().map(t => t.getInt(0)).toArray === Array(0, 2))
+
+    assert(hashed.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
+    assert(hashed.get(unsafeData(2)).map(t => t.row).toArray === Array(unsafeData(2)))
+    assert(hashed.get(unsafeProj(InternalRow(10L, 10))) === null)
+
+    val data2 = CompactBuffer[InternalRow](unsafeData(3).copy())
+    data2 += unsafeData(3).copy()
+    assert(hashed.get(unsafeData(3)).map(t => t.row).toArray === data2.toArray)
+
+    val os = new ByteArrayOutputStream()
+    val out = new ObjectOutputStream(os)
+    hashed.writeExternal(out)
+    out.flush()
+    val in = new ObjectInputStream(new ByteArrayInputStream(os.toByteArray))
+    val hashed2 = new LongHashedRelation()
+    hashed2.readExternal(in)
+    assert(hashed2.get(unsafeData(1)).map(t => t.row).toArray === Array(unsafeData(1)))
+    assert(hashed2.get(unsafeData(2)).map(t => t.row).toArray === Array(unsafeData(2)))
+    assert(hashed2.get(unsafeProj(InternalRow(10L, 10))) === null)
+    assert(hashed2.get(unsafeData(3)).map(t => t.row).toArray === data2)
+    assert(hashed2.getNullRows().size == 3)
+    assert(hashed2.getUnMatched().map(t => t.getInt(0)).toArray === Array(0, 2))
   }
 
   test("LongToUnsafeRowMap with very wide range") {
@@ -234,7 +340,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       var c = 0
       while (r.hasNext) {
         val rr = r.next()
-        assert(rr.getLong(0) === k)
+        assert(rr.row.getLong(0) === k)
         c += 1
       }
     }
@@ -245,7 +351,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       if (r != null) {
         assert(r.hasNext)
         while (r.hasNext) {
-          assert(r.next().getLong(0) === k)
+          assert(r.next().row.getLong(0) === k)
         }
       }
       i += 1
@@ -262,19 +368,19 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
     val unsafeProj = UnsafeProjection.create(
       Seq(BoundReference(0, LongType, false), BoundReference(1, IntegerType, true)))
     val rows = (0 until 100).map(i => unsafeProj(InternalRow(Int.int2long(i), i + 1)).copy())
-    val longRelation = LongHashedRelation(rows.iterator ++ rows.iterator, key, 100, mm)
+    val longRelation = LongHashedRelation(rows.iterator ++ rows.iterator, key, false, 100, mm)
     val longRelation2 = ser.deserialize[LongHashedRelation](ser.serialize(longRelation))
     (0 until 100).foreach { i =>
-      val rows = longRelation2.get(i).toArray
-      assert(rows.length === 2)
-      assert(rows(0).getLong(0) === i)
-      assert(rows(0).getInt(1) === i + 1)
-      assert(rows(1).getLong(0) === i)
-      assert(rows(1).getInt(1) === i + 1)
+      val items = longRelation2.get(i).toArray
+      assert(items.length === 2)
+      assert(items(0).row.getLong(0) === i)
+      assert(items(0).row.getInt(1) === i + 1)
+      assert(items(1).row.getLong(0) === i)
+      assert(items(1).row.getInt(1) === i + 1)
     }
 
     // Testing Kryo serialization of UnsafeHashedRelation
-    val unsafeHashed = UnsafeHashedRelation(rows.iterator, key, 1, mm)
+    val unsafeHashed = UnsafeHashedRelation(rows.iterator, key, true, 1, mm)
     val os = new ByteArrayOutputStream()
     val out = new ObjectOutputStream(os)
     unsafeHashed.asInstanceOf[UnsafeHashedRelation].writeExternal(out)
@@ -300,7 +406,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       unsafeRow
     }
 
-    val unsafeRelation = UnsafeHashedRelation(rows, key, 1000, mm)
+    val unsafeRelation = UnsafeHashedRelation(rows, key, false, 1000, mm)
     assert(unsafeRelation.estimatedSize > (2L << 30))
     unsafeRelation.close()
 
@@ -309,7 +415,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       unsafeRow.setInt(1, i)
       unsafeRow
     }
-    val longRelation = LongHashedRelation(rows2, key, 1000, mm)
+    val longRelation = LongHashedRelation(rows2, key, false, 1000, mm)
     assert(longRelation.estimatedSize > (2L << 30))
     longRelation.close()
   }
@@ -326,7 +432,7 @@ class HashedRelationSuite extends SparkFunSuite with SharedSQLContext {
       unsafeRow.setInt(1, i)
       unsafeRow
     }
-    val m = LongHashedRelation(rows, key, 100 << 20, mm)
+    val m = LongHashedRelation(rows, key, false, 100 << 20, mm)
     m.close()
   }
 }

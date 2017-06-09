@@ -63,7 +63,7 @@ import org.apache.spark.util.collection.unsafe.sort.UnsafeSorterSpillWriter;
  * is compatible with {@link org.apache.spark.util.collection.unsafe.sort.UnsafeExternalSorter},
  * so we can pass records from this map directly into the sorter to sort records in place.
  */
-public final class BytesToBytesMap extends MemoryConsumer {
+public class BytesToBytesMap extends MemoryConsumer {
 
   private static final Logger logger = LoggerFactory.getLogger(BytesToBytesMap.class);
 
@@ -107,7 +107,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
    * Position {@code 2 * i} in the array is used to track a pointer to the key at index {@code i},
    * while position {@code 2 * i + 1} in the array holds key's full 32-bit hashcode.
    */
-  @Nullable private LongArray longArray;
+  @Nullable protected LongArray longArray;
   // TODO: we're wasting 32 bits of space here; we can probably store fewer bits of the hashcode
   // and exploit word-alignment to use fewer bits to hold the address.  This might let us store
   // only one long per map entry, increasing the chance that this array will fit in cache at the
@@ -502,6 +502,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
     }
   }
 
+  protected long unMaskMatchedBits(long fullKeyAddress) {
+    return fullKeyAddress;
+  }
+
   /**
    * Handle returned by {@link BytesToBytesMap#lookup(Object, long, int)} function.
    */
@@ -528,6 +532,7 @@ public final class BytesToBytesMap extends MemoryConsumer {
     @Nullable private MemoryBlock memoryPage;
 
     private void updateAddressesAndSizes(long fullKeyAddress) {
+      fullKeyAddress = unMaskMatchedBits(fullKeyAddress);
       updateAddressesAndSizes(
         taskMemoryManager.getPage(fullKeyAddress),
         taskMemoryManager.getOffsetInPage(fullKeyAddress));
@@ -606,6 +611,10 @@ public final class BytesToBytesMap extends MemoryConsumer {
      */
     public boolean isDefined() {
       return isDefined;
+    }
+
+    public int getPos() {
+      return pos;
     }
 
     /**

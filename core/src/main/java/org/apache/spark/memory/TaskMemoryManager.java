@@ -61,11 +61,11 @@ public class TaskMemoryManager {
   private static final Logger logger = LoggerFactory.getLogger(TaskMemoryManager.class);
 
   /** The number of bits used to address the page table. */
-  private static final int PAGE_NUMBER_BITS = 13;
+  public static final int PAGE_NUMBER_BITS = 13;
 
   /** The number of bits used to encode offsets in data pages. */
   @VisibleForTesting
-  static final int OFFSET_BITS = 64 - PAGE_NUMBER_BITS;  // 51
+  public static final int OFFSET_BITS = 64 - PAGE_NUMBER_BITS;  // 51
 
   /** The number of entries in the page table. */
   private static final int PAGE_TABLE_SIZE = 1 << PAGE_NUMBER_BITS;

@@ -47,12 +47,18 @@ case class ShuffledHashJoinExec(
   override def requiredChildDistribution: Seq[Distribution] =
     ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
 
+  private def outerJoinHashSameSide : Boolean = {
+    (joinType == LeftOuter && buildSide == BuildLeft) ||
+      (joinType == RightOuter && buildSide == BuildRight)
+  }
+
   private def buildHashedRelation(iter: Iterator[InternalRow]): HashedRelation = {
     val buildDataSize = longMetric("buildDataSize")
     val buildTime = longMetric("buildTime")
     val start = System.nanoTime()
     val context = TaskContext.get()
-    val relation = HashedRelation(iter, buildKeys, taskMemoryManager = context.taskMemoryManager())
+    val relation = HashedRelation(iter, buildKeys, outerJoinHashSameSide,
+        taskMemoryManager = context.taskMemoryManager())
     buildTime += (System.nanoTime() - start) / 1000000
     buildDataSize += relation.estimatedSize
     // This relation is usually used until the end of task.
