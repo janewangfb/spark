@@ -86,8 +86,8 @@ private[execution] sealed trait HashedRelation extends KnownSizeEstimation {
   def markMatched(item: Item) : Unit
 
   /**
-    * Return those rows with null keys.
-    */
+   * Return those rows with null keys.
+   */
   def getNullRows(): Iterator[InternalRow]
 
   /**
@@ -181,8 +181,8 @@ private[joins] class BytesToUnsafeRowMap(taskMemoryManager: TaskMemoryManager,
   }
 
   /**
-    * Returns an iterator of UnsafeRow for multiple linked values.
-    */
+   * Returns an iterator of UnsafeRow for multiple linked values.
+   */
   def valueIter(pos: Int, resultRow: UnsafeRow): Iterator[Item] = {
     new Iterator[Item] {
       val uaoSize = UnsafeAlignedOffset.getUaoSize
@@ -895,7 +895,9 @@ private[execution] final class LongToUnsafeRowMap(val mm: TaskMemoryManager, cap
   }
 
   def getUnMatched(resultRow: UnsafeRow) : Iterator[InternalRow] = {
+    // scalastyle:off println
     println("!!!!!!!!! map size: " + array.length)
+    // scalastyle:on
     new Iterator[UnsafeRow] {
       val idxIncr = if (isDense) 1 else 2
       val addrAdjust = if (isDense) 0 else 1
